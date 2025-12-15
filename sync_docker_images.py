@@ -2,6 +2,8 @@ import sys
 import json
 import urllib.request
 import urllib.error
+import time
+import os
 
 # ================= 配置区域 =================
 # 注意：地址不要带最后的斜杠
@@ -37,12 +39,63 @@ def check_blob_exists(registry, repo, digest):
             return False
         raise e
 
+class ProgressReader:
+    def __init__(self, response, total_size):
+        self.response = response
+        self.total_size = total_size
+        self.bytes_read = 0
+        self.start_time = time.time()
+        self.last_time = self.start_time
+        self.last_bytes = 0
+
+    def read(self, size):
+        chunk = self.response.read(size)
+        if chunk:
+            self.bytes_read += len(chunk)
+            self._print_progress()
+        return chunk
+
+    def __iter__(self):
+        # urllib/http.client iterates over the data if it's an iterable
+        while True:
+            chunk = self.read(8192 * 4) # 32KB chunks
+            if not chunk:
+                break
+            yield chunk
+
+    def _print_progress(self):
+        current_time = time.time()
+        # Update every 0.1s or if finished
+        if current_time - self.last_time < 0.1 and self.bytes_read < self.total_size:
+            return
+
+        elapsed = current_time - self.start_time
+        speed = self.bytes_read / elapsed if elapsed > 0 else 0
+        
+        # Format size
+        def fmt_size(b):
+            if b < 1024: return f"{b}B"
+            if b < 1024*1024: return f"{b/1024:.1f}KB"
+            return f"{b/(1024*1024):.1f}MB"
+
+        percent = 100.0 * self.bytes_read / self.total_size if self.total_size > 0 else 0
+        bar_len = 30
+        filled = int(bar_len * percent / 100)
+        bar = "=" * filled + ">" + " " * (bar_len - filled - 1)
+        
+        # Clear line and print
+        sys.stdout.write(f"\r    [{bar}] {percent:.1f}% {fmt_size(self.bytes_read)}/{fmt_size(self.total_size)} {fmt_size(speed)}/s")
+        sys.stdout.flush()
+        
+        self.last_time = current_time
+
 def stream_upload_blob(repo, digest):
     """核心：从源读取流，直接写入目标 (流式传输，不占内存/硬盘)"""
     # 1. 从源获取下载流
     src_url = f"{SOURCE_REGISTRY}/v2/{repo}/blobs/{digest}"
     try:
         src_resp = request("GET", src_url)
+        total_size = int(src_resp.headers.get("Content-Length", 0))
     except urllib.error.HTTPError as e:
         print(f"  [ERROR] Source missing blob {digest}")
         return False
@@ -57,35 +110,30 @@ def stream_upload_blob(repo, digest):
         return False
 
     # 3. 管道传输：Source Read -> Target Write
-    # 使用 chunked 传输防止内存溢出
     print(f"    -> Transferring {digest[:12]}...", end="", flush=True)
     
-    # 注意：标准 urllib put 数据需要一次性读入或者封装成 iterable
-    # 为了兼容性和简单性，这里分块读取并在内存缓冲 (比如 10MB)
-    # 对于极低带宽，这完全没问题
-    
     # 重新构造 PUT 请求
-    # 拼接 digest 参数以完成上传
     if "?" in upload_location:
         upload_url = f"{upload_location}&digest={digest}"
     else:
         upload_url = f"{upload_location}?digest={digest}"
 
-    # 读取源数据 (注意：如果层很大，urllib 可能会预加载。
-    # 完美的流式需要更复杂的 socket 操作，但对于 3MB/s 带宽，直接 read() 问题不大，
-    # 或者分块 PUT。这里为了代码短小使用一次性 read，
-    # 只要你的内存大于最大的 Layer (通常 < 500MB) 即可)
-    blob_data = src_resp.read() 
+    # 使用 ProgressReader 包装 response
+    # 注意：urllib 如果接收 iterable data，会使用 chunked encoding，除非指定 Content-Length
+    # 我们这里指定 Content-Length，让它知道总长度
+    reader = ProgressReader(src_resp, total_size)
     
-    req = urllib.request.Request(upload_url, data=blob_data, method="PUT")
+    req = urllib.request.Request(upload_url, data=reader, method="PUT")
     req.add_header("Content-Type", "application/octet-stream")
+    if total_size > 0:
+        req.add_header("Content-Length", str(total_size))
     
     try:
         urllib.request.urlopen(req)
-        print(" Done.")
+        print("\n    Done.") # Newline after progress bar
         return True
     except Exception as e:
-        print(f" Failed: {e}")
+        print(f"\n    Failed: {e}")
         return False
 
 def sync_image(image_tag):
